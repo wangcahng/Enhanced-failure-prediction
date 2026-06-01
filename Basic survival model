@@ -1,0 +1,169 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn_pandas import DataFrameMapper  # 用于创建特征转换管道
+from sklearn.model_selection import train_test_split
+import torch
+import torchtuples as tt  # PyTorch工具库
+from pycox.models import CoxPH  # Cox比例风险模型
+from pycox.evaluation import EvalSurv  # 生存分析评估工具
+
+# 设置随机种子确保结果可复现
+np.random.seed(123)
+_ = torch.manual_seed(123)
+
+# 在导入matplotlib后立即设置全局字体
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['savefig.dpi'] = 600
+plt.rcParams['figure.dpi'] = 600
+plt.rcParams['axes.titlesize'] = 14  # 增大标题字号
+plt.rcParams['axes.labelsize'] = 12  # 增大坐标轴标签字号
+plt.rcParams['xtick.labelsize'] = 10  # 增大x轴刻度字号
+plt.rcParams['ytick.labelsize'] = 10  # 增大y轴刻度字号
+plt.rcParams['font.weight'] = 'bold'  # 设置字体为粗体
+plt.rcParams['axes.titleweight'] = 'bold'  # 设置标题字体为粗体
+plt.rcParams['axes.labelweight'] = 'bold'  # 设置坐标轴标签字体为粗体
+
+# ==================== 数据加载 ====================
+# 从Excel文件读取生存分析数据
+# df = pd.read_excel(r"D:\博士学习\项目学习\课题2-管网健康状态评估与维护\GIS数据处理\第二次处理\管线数据-建模-声信号量化.xlsx")
+df = pd.read_excel(r"D:\pythonProject3\生存分析\Enh—SS-DeepSurv-0.9-声信号量化.xlsx")
+df = df.iloc[:, 1:-1]  # 选择所有行和列
+
+# ==================== 数据集划分 ====================
+print("原始数据集样本量:", df.shape[0])
+
+# 划分训练测试集，按事件状态分层
+df_train, df_test = train_test_split(df, test_size=0.2, random_state=46, stratify=df['Event'])
+df_train, df_val = train_test_split(df_train, test_size=0.2, random_state=46, stratify=df_train['Event'])
+
+print(f"训练集大小: {df_train.shape[0]}, 验证集大小: {df_val.shape[0]}, 测试集大小: {df_test.shape[0]}")
+df_train.head()  # 查看训练集前几行
+
+# ==================== 特征工程 ====================
+# 定义需要标准化的特征列
+# cols_standardize = ["Pipe diameter", "Pipe material", "Pipe length", "Connection type", "X", "Y"]
+cols_standardize = ["Pipe diameter", "Pipe material", "Pipe length", "Connection type", "X", "Y", "Signal value"]
+# 创建标准化转换器列表
+standardize = [([col], StandardScaler()) for col in cols_standardize]
+
+# 创建DataFrame映射器
+x_mapper = DataFrameMapper(standardize)
+
+# 应用特征转换
+x_train = x_mapper.fit_transform(df_train).astype('float32')  # 训练集拟合并转换
+x_val = x_mapper.transform(df_val).astype('float32')          # 验证集转换
+x_test = x_mapper.transform(df_test).astype('float32')        # 测试集转换
+
+# ==================== 目标变量处理 ====================
+# 定义获取目标变量的函数 (生存时间和事件指示)
+get_target = lambda df: (df['Duration'].values, df['Event'].values)
+
+# 获取各数据集的目标变量
+y_train = get_target(df_train)  # (生存时间, 事件指示)
+y_val = get_target(df_val)
+durations_test, events_test = get_target(df_test)  # 测试集的生存时间和事件
+
+# 验证数据元组
+val = (x_val, y_val)
+
+# ==================== 神经网络模型构建 ====================
+in_features = x_train.shape[1]  # 输入特征维度
+num_nodes = [512, 128, 64, 32, 16]   # 网络各层节点数
+# num_nodes = [512, 128, 64, 32, 16]  # 网络各层节点数
+out_features = 1                 # 输出层维度
+batch_norm = True                # 使用批标准化
+dropout = 0.1                    # Dropout比例
+output_bias = False              # 输出层不使用偏置
+
+# 创建多层感知器 (MLP)
+net = tt.practical.MLPVanilla(
+    in_features, num_nodes, out_features,
+    batch_norm, dropout, output_bias=output_bias
+)
+
+# ==================== 模型初始化 ====================
+model = CoxPH(net, tt.optim.Adam)  # 使用Adam优化器的CoxPH模型
+batch_size = 2048                 # 批大小
+model.optimizer.set_lr(0.001)       # 设置学习率
+epochs = 200                       # 训练轮数
+
+# ==================== 模型训练 ====================
+# 训练模型并记录日志
+log = model.fit(
+    x_train, y_train, batch_size, epochs,
+    verbose=True,  # 显示训练过程
+    val_data=val,  # 验证数据
+    val_batch_size=batch_size
+)
+
+# 绘制训练损失曲线
+log.plot()
+plt.title('Training and Validation Loss')
+# plt.show()
+
+# 计算验证集的部分对数似然
+print("验证集部分对数似然:", model.partial_log_likelihood(*val).mean())
+# 计算基线风险函数
+_ = model.compute_baseline_hazards()
+
+# ==================== 模型保存 ====================
+# torch.save(model, 'DeepSurv.pkl')
+# print("模型已保存为 'DeepSurv.pkl'")
+
+# ==================== 模型预测 ====================
+
+# 预测测试集的生存函数
+surv = model.predict_surv_df(x_test)  # 返回DataFrame (行为时间点，列为样本)
+
+# ==================== 导出生存函数到CSV ====================
+# surv_file_path = 'survival_probabilities-ENH.csv'
+# surv.T.to_csv(surv_file_path, index=True)
+# print(f"生存函数已导出至: {surv_file_path}")
+
+# ==================== 可视化生存曲线 ====================
+# 绘制前300个样本的生存曲线
+surv.iloc[:, :30].plot(figsize=(10, 6), legend=False)
+plt.ylabel('Survival probability')
+plt.xlabel('Time (Year)')
+plt.title('Survival Probability of Test Samples')
+plt.grid(True)
+plt.savefig('survival_curves.png', dpi=600)
+# plt.show()
+
+print(f"durations_test shape: {durations_test.shape}")
+print(f"events_test shape: {events_test.shape}")
+print(f"surv shape: {surv.shape}")
+
+
+# ==================== 模型评估 ====================
+# 创建评估器
+ev = EvalSurv(
+    surv, durations_test, events_test,
+    censor_surv='km'  # 使用Kaplan-Meier估计删失分布
+)
+
+# 计算时间相关一致性指数 (C-index)
+c_index = ev.concordance_td('antolini')
+print(f"时间相关一致性指数 (C-index): {c_index:.4f}")
+
+# 创建评估时间网格
+time_grid = np.linspace(durations_test.min(), durations_test.max(), 200)
+
+# 绘制Brier分数曲线
+brier_scores = ev.brier_score(time_grid)
+brier_scores.plot(title='Brier Scores over Time')
+plt.ylabel('Brier score')
+plt.grid(True)
+plt.savefig('brier_scores.png', dpi=600)
+# plt.show()
+
+# 计算综合评估指标
+integrated_brier = ev.integrated_brier_score(time_grid)
+integrated_nbll = ev.integrated_nbll(time_grid)
+
+print(f"综合Brier分数: {integrated_brier:.4f}")
+print(f"综合负二项对数似然: {integrated_nbll:.4f}")
+
