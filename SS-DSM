@@ -1,0 +1,384 @@
+# 生成增强的数据集
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn_pandas import DataFrameMapper
+from sklearn.model_selection import train_test_split
+import torch
+import torchtuples as tt
+from pycox.models import DeepHitSingle
+from pycox.evaluation import EvalSurv
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+class SimpleSemiSupervisedSurvival():
+    def __init__(self, seed=123):
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        self.x_mapper = None
+        # self.feature_cols = ["Pipe diameter", "Pipe material", "Pipe length",
+        #                      "Connection type", "X", "Y"]
+        self.feature_cols = ["Pipe diameter", "Pipe material", "Pipe length",
+                             "Connection type", "X", "Y", "Signal value"]
+        self.num_durations = 100  # DeepHit需要持续时间分箱数
+
+    def fit_mapper(self, df):
+        """初始化并拟合标准化器"""
+        standardize = [([col], StandardScaler()) for col in self.feature_cols]
+        self.x_mapper = DataFrameMapper(standardize)
+        self.x_mapper.fit(df)
+
+    def prepare_data(self, df):
+        """数据预处理"""
+        # 划分训练测试集，按事件状态分层
+        df_train, df_test = train_test_split(df, test_size=0.2, random_state=42, stratify=df['Event'])
+        df_train, df_val = train_test_split(df_train, test_size=0.2, random_state=42, stratify=df_train['Event'])
+
+        # 特征标准化
+        standardize = [([col], StandardScaler()) for col in self.feature_cols]
+        self.x_mapper = DataFrameMapper(standardize)
+
+        x_train = self.x_mapper.fit_transform(df_train).astype('float32')
+        x_val = self.x_mapper.transform(df_val).astype('float32')
+        x_test = self.x_mapper.transform(df_test).astype('float32')
+
+        # 目标变量
+        get_target = lambda df: (df['Duration'].values, df['Event'].values)
+        y_train, y_val, y_test = get_target(df_train), get_target(df_val), get_target(df_test)
+
+        # DeepHit需要将持续时间离散化
+        # 创建持续时间分箱
+        labtrans = DeepHitSingle.label_transform(self.num_durations)
+
+        # 转换训练集标签
+        y_train = labtrans.fit_transform(*y_train)
+        y_val = labtrans.transform(*y_val)
+
+        # 保存标签转换器
+        self.labtrans = labtrans
+
+        return (x_train, y_train), (x_val, y_val), (x_test, y_test)
+
+    def build_model(self, input_dim):
+        """构建DeepHit模型"""
+        # 注意：DeepHit输出维度等于num_durations
+        net = tt.practical.MLPVanilla(input_dim, [512, 128, 64, 32, 16],
+                                      self.labtrans.out_features,
+                                      batch_norm=True, dropout=0.1)
+        model = DeepHitSingle(net, tt.optim.Adam, alpha=0.2, sigma=0.1,
+                              duration_index=self.labtrans.cuts)
+        model.optimizer.set_lr(0.001)
+        return model
+
+    def train_model(self, train_data, val_data, epochs=200):
+        """训练模型"""
+        x_train, y_train = train_data
+        x_val, y_val = val_data
+
+        model = self.build_model(x_train.shape[1])
+
+        log = model.fit(x_train, y_train, batch_size=2048, epochs=epochs,
+                        verbose=False, val_data=(x_val, y_val))
+
+        return model, log
+
+    def predict_median_time(self, model, x_data):
+        """预测不同分位生存时间"""
+        surv_df = model.predict_surv_df(x_data)
+        median_times = []
+        for i in range(surv_df.shape[1]):
+            surv_curve = surv_df.iloc[:, i]
+            idx = np.argmin(np.abs(surv_curve.values - 0.90))
+            median_times.append(surv_df.index[idx])
+        return np.array(median_times)
+
+    def semi_supervised_enhancement(self, df):
+        """半监督数据增强"""
+        print("开始半监督数据增强...")
+
+        # 创建数据副本并添加原始Duration列
+        enhanced_df = df.copy()
+        enhanced_df['Original_Duration'] = df['Duration']  # 保存原始Duration
+
+        # 分离事件和删失数据
+        event_data = df[df['Event'] == 1]
+        censored_data = df[df['Event'] == 0]
+
+        print(f"事件数据: {len(event_data)}, 删失数据: {len(censored_data)}")
+
+        if len(event_data) == 0 or len(censored_data) == 0:
+            return enhanced_df, 0
+
+        # 为事件数据准备标签转换器
+        labtrans = DeepHitSingle.label_transform(self.num_durations)
+        durations_event = event_data['Duration'].values
+        events_event = event_data['Event'].values
+        y_event = labtrans.fit_transform(durations_event, events_event)
+
+        # 使用事件数据训练模型
+        x_event = self.x_mapper.transform(event_data).astype('float32')
+
+        # 构建并训练DeepHit模型
+        net = tt.practical.MLPVanilla(x_event.shape[1], [512, 128, 64, 32, 16],
+                                      labtrans.out_features,
+                                      batch_norm=True, dropout=0.1)
+        model = DeepHitSingle(net, tt.optim.Adam, alpha=0.2, sigma=0.1,
+                              duration_index=labtrans.cuts)
+        model.optimizer.set_lr(0.001)
+
+        model.fit(x_event, y_event, batch_size=2048, epochs=200, verbose=False)
+
+        # 预测删失数据
+        x_censored = self.x_mapper.transform(censored_data).astype('float32')
+        pred_times = self.predict_median_time(model, x_censored)
+        orig_times = censored_data['Duration'].values
+
+        # 识别高置信度预测
+        high_conf_mask = pred_times > orig_times
+        high_conf_count = np.sum(high_conf_mask)
+
+        print(f"高置信度预测: {high_conf_count}/{len(censored_data)}")
+
+        # 创建修改记录
+        modification_records = []
+
+        # 更新增强数据
+        for i, idx in enumerate(censored_data.index[high_conf_mask]):
+            original_duration = enhanced_df.loc[idx, 'Duration']
+            predicted_duration = pred_times[high_conf_mask][i]
+
+            # 记录修改信息
+            modification_records.append({
+                'Index': idx,
+                'Original_Duration': original_duration,
+                'Predicted_Duration': predicted_duration,
+                'Original_Event': 0,
+                'New_Event': 1,
+                'Change_Ratio': predicted_duration / original_duration if original_duration > 0 else float('inf')
+            })
+
+            # 更新数据
+            enhanced_df.loc[idx, 'Duration'] = predicted_duration
+            enhanced_df.loc[idx, 'Event'] = 1
+
+        # 将修改记录保存为属性，方便后续查看
+        self.modification_records = pd.DataFrame(modification_records)
+
+        return enhanced_df, high_conf_count
+
+    def export_enhanced_data(self, original_df, enhanced_df, filename='enhanced_dataset.xlsx'):
+        """导出增强后的数据集到Excel，包含详细信息"""
+        print(f"\n导出增强数据到 {filename}...")
+
+        # 创建详细的增强报告
+        report_data = enhanced_df.copy()
+
+        # 添加修改标记列
+        report_data['Data_Modified'] = False
+        report_data['Modification_Type'] = '未修改'
+
+        if hasattr(self, 'modification_records') and len(self.modification_records) > 0:
+            modified_indices = self.modification_records['Index'].values
+            report_data.loc[modified_indices, 'Data_Modified'] = True
+            report_data.loc[modified_indices, 'Modification_Type'] = '删失转事件'
+
+        # 计算修改统计
+        total_modified = report_data['Data_Modified'].sum()
+        event_increase = enhanced_df['Event'].sum() - original_df['Event'].sum()
+
+        print(f"总修改样本: {total_modified}")
+        print(f"事件数量增加: {event_increase}")
+        print(f"最终事件率: {enhanced_df['Event'].mean():.2%}")
+
+        # 创建Excel写入器，保存多个sheet
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Sheet 1: 完整增强数据
+            enhanced_df.to_excel(writer, sheet_name='增强数据', index=True)
+
+            # Sheet 2: 修改记录详情
+            if hasattr(self, 'modification_records') and len(self.modification_records) > 0:
+                self.modification_records.to_excel(writer, sheet_name='修改记录', index=False)
+
+            # Sheet 3: 数据对比统计
+            comparison_stats = self._create_comparison_stats(original_df, enhanced_df)
+            comparison_stats.to_excel(writer, sheet_name='数据对比', index=True)
+
+            # Sheet 4: 原始数据（备份）
+            original_df.to_excel(writer, sheet_name='原始数据', index=True)
+
+        print(f"增强数据已成功导出到 {filename}")
+
+        # 打印简要统计
+        self._print_enhancement_summary(original_df, enhanced_df)
+
+        return report_data
+
+    def _create_comparison_stats(self, original_df, enhanced_df):
+        """创建数据对比统计"""
+        stats_data = []
+
+        # 基本统计
+        stats_data.append(['总样本数', len(original_df), len(enhanced_df), '无变化'])
+        stats_data.append(['事件数量', original_df['Event'].sum(), enhanced_df['Event'].sum(),
+                           f"+{enhanced_df['Event'].sum() - original_df['Event'].sum()}"])
+        stats_data.append(['事件比例', f"{original_df['Event'].mean():.2%}",
+                           f"{enhanced_df['Event'].mean():.2%}",
+                           f"{enhanced_df['Event'].mean() - original_df['Event'].mean():+.2%}"])
+
+        # Duration统计
+        stats_data.append(['Duration均值', f"{original_df['Duration'].mean():.2f}",
+                           f"{enhanced_df['Duration'].mean():.2f}",
+                           f"{enhanced_df['Duration'].mean() - original_df['Duration'].mean():+.2f}"])
+        stats_data.append(['Duration标准差', f"{original_df['Duration'].std():.2f}",
+                           f"{enhanced_df['Duration'].std():.2f}",
+                           f"{enhanced_df['Duration'].std() - original_df['Duration'].std():+.2f}"])
+
+        # 修改统计
+        if hasattr(self, 'modification_records') and len(self.modification_records) > 0:
+            mod_records = self.modification_records
+            stats_data.append(['修改样本数', 0, len(mod_records), f"+{len(mod_records)}"])
+            stats_data.append(['平均修改比例', '-', f"{mod_records['Change_Ratio'].mean():.2f}", '-'])
+        else:
+            stats_data.append(['修改样本数', 0, 0, "无修改"])
+
+        stats_df = pd.DataFrame(stats_data, columns=['指标', '原始数据', '增强数据', '变化'])
+        return stats_df
+
+    def _print_enhancement_summary(self, original_df, enhanced_df):
+        """打印增强摘要"""
+        print("\n=== 数据增强摘要 ===")
+        print(f"原始数据 - 事件: {original_df['Event'].sum()}/{len(original_df)} "
+              f"({original_df['Event'].mean():.2%})")
+        print(f"增强数据 - 事件: {enhanced_df['Event'].sum()}/{len(enhanced_df)} "
+              f"({enhanced_df['Event'].mean():.2%})")
+
+        if hasattr(self, 'modification_records') and len(self.modification_records) > 0:
+            mod_records = self.modification_records
+            print(f"数据修改: {len(mod_records)} 个样本从删失转为事件")
+            print(f"平均Duration修改比例: {mod_records['Change_Ratio'].mean():.2f}x")
+            print(f"最小修改比例: {mod_records['Change_Ratio'].min():.2f}x")
+            print(f"最大修改比例: {mod_records['Change_Ratio'].max():.2f}x")
+
+    def evaluate_model(self, model, test_data):
+        """模型评估"""
+        x_test, (durations, events) = test_data
+        surv = model.predict_surv_df(x_test)
+
+        ev = EvalSurv(surv, durations, events, censor_surv='km')
+        c_index = ev.concordance_td('antolini')
+
+        time_grid = np.linspace(durations.min(), durations.max(), 200)
+        ibs = ev.integrated_brier_score(time_grid)
+
+        return c_index, ibs
+
+    def compare_datasets(self, original_df, enhanced_df):
+        """比较数据集性能"""
+        print("\n比较数据集性能...")
+
+        results = {}
+
+        for name, data in [("原始数据", original_df), ("增强数据", enhanced_df)]:
+            # 准备数据
+            train_data, val_data, test_data = self.prepare_data(data)
+            x_test, (durations_test, events_test) = test_data
+            # 打印测试集事件数量
+            print(f"{name}测试集: 总样本数={len(events_test)}, 事件数={sum(events_test)}")
+
+            # 训练模型
+            model, _ = self.train_model(train_data, val_data, epochs=200)
+
+            # 评估
+            c_index, ibs = self.evaluate_model(model, test_data)
+            results[name] = {'c_index': c_index, 'ibs': ibs}
+
+            print(f"{name}: C-index = {c_index:.4f}, IBS = {ibs:.4f}")
+
+        # 判断增强数据是否更好
+        a_better = (results["增强数据"]['c_index'] > results["原始数据"]['c_index'] and
+                    results["增强数据"]['ibs'] < results["原始数据"]['ibs'])
+
+        print(f"\n增强数据 {'优于' if a_better else '不优于'} 原始数据")
+        return results, a_better
+
+
+def main():
+    # 设置随机种子范围
+    # seed_start = 123
+    # seed_end = 127
+    #
+    # for seed in range(seed_start, seed_end + 1):
+    #     print(f"\n{'=' * 60}")
+    #     print(f"开始实验: 随机种子 = {seed}")
+    #     print(f"{'=' * 60}")
+    #
+    #     # 初始化模型
+    #     model = SimpleSemiSupervisedSurvival(seed)
+
+    # # 初始化模型
+    model = SimpleSemiSupervisedSurvival()
+
+    # 加载数据
+    df = pd.read_excel(r"D:\博士学习\项目学习\课题2-管网健康状态评估与维护\GIS数据处理\第二次处理\管线数据-建模-声信号量化.xlsx")
+    df = df.iloc[:, 1:]
+    print(f"数据形状: {df.shape}")
+
+    # 首先初始化标准化器
+    model.fit_mapper(df)
+
+    # 半监督数据增强
+    enhanced_df, enhanced_count = model.semi_supervised_enhancement(df)
+
+    # 导出增强数据到Excel
+    report_data = model.export_enhanced_data(df, enhanced_df, 'Enh—SS-DeepHit-0.90-声信号量化.xlsx')
+
+    # 性能比较
+    results, is_better = model.compare_datasets(df, enhanced_df)
+
+    # 结果可视化
+    plt.figure(figsize=(10, 5))
+
+    # C-index比较（越高越好）
+    plt.subplot(1, 2, 1)
+    c_values = [results['原始数据']['c_index'], results['增强数据']['c_index']]
+    bars = plt.bar(['原始数据', '增强数据'], c_values, color=['lightblue', 'lightcoral'])
+    plt.title('C-index 比较')
+    plt.ylabel('C-index')
+    # 在柱状图上添加数值标签
+    for bar, value in zip(bars, c_values):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                 f'{value:.4f}', ha='center', va='bottom')
+
+    # IBS比较（越低越好）
+    plt.subplot(1, 2, 2)
+    ibs_values = [results['原始数据']['ibs'], results['增强数据']['ibs']]
+    bars = plt.bar(['原始数据', '增强数据'], ibs_values, color=['lightblue', 'lightcoral'])
+    plt.title('IBS 比较')
+    plt.ylabel('IBS')
+    # 在柱状图上添加数值标签
+    for bar, value in zip(bars, ibs_values):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001,
+                 f'{value:.4f}', ha='center', va='bottom')
+
+    plt.tight_layout()
+    plt.savefig('comparison_result.png', dpi=300, bbox_inches='tight')
+    # plt.show()
+
+    # 输出总结
+    print(f"\n=== 总结 ===")
+    print(f"增强样本数量: {enhanced_count}")
+    print(f"是否使用增强数据: {'是' if is_better else '否'}")
+
+    # 如果修改记录存在，显示前几条
+    if hasattr(model, 'modification_records') and len(model.modification_records) > 0:
+        print(f"\n前5条修改记录:")
+        print(model.modification_records.head())
+
+
+if __name__ == "__main__":
+    main()
